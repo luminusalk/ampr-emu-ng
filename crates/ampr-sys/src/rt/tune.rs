@@ -107,7 +107,10 @@ pub(crate) static KNOBS: [Knob; 16] = [
         false,
         1,
         AMPR_EMU_PACK_WORKER_CAPACITY as u32,
-        AMPR_EMU_PACK_WORKERS,
+        // Issue #13: conservative startup budget for games that are near the
+        // process thread/resource limit. Debug /set?workers=N can override.
+        // Combined with the lazy two-reader pool on fix/crimson.
+        2,
     ),
     knob(
         "pipelines",
@@ -215,7 +218,10 @@ pub(crate) fn workers() -> u32 {
     if ON {
         get(WORKERS)
     } else {
-        AMPR_EMU_PACK_WORKERS
+        // Release does not read /data/ampr_emu_tune.txt; keep its pack-worker
+        // startup budget aligned with the debug default for issue #13.
+        // Deliberately conservative; not an adaptive thread reservation.
+        2
     }
 }
 pub(crate) fn pipelines() -> usize {
