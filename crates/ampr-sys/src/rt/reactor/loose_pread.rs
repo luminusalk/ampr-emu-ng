@@ -358,7 +358,8 @@ impl AprAioReactor {
         // <= AMPR_EMU_APR_LOOSE_PREAD_PACK_RESERVE threads (only the debug
         // `pread_threads` knob allows it) the reserve cannot be kept: the
         // cap floors at 1 loose task.
-        if !self.ensure_pread_workers() {
+        let demand = (self.preadPendingCount as usize).saturating_add(1);
+        if !self.ensure_pread_workers(demand) {
             return false;
         }
         let looseCap = (self
