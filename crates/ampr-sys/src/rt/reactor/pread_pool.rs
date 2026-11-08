@@ -9,6 +9,76 @@
 use super::*;
 use crate::rt::stats::{self, Stat};
 
+// PREAD_DIAG_V2: debug-only diagnostics for parallel pread work.
+#[cfg(feature = "mem_report")]
+static PREAD_DIAG_LOCK_V2: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "mem_report")]
+static PREAD_DIAG_SEQ_V2: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "mem_report")]
+struct PreadDiagLineV2 {
+    bytes: [u8; 256],
+    used: usize,
+}
+#[cfg(feature = "mem_report")]
+impl core::fmt::Write for PreadDiagLineV2 {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        let src = value.as_bytes();
+        if src.len() > self.bytes.len() - self.used {
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.used..self.used + src.len()].copy_from_slice(src);
+        self.used += src.len();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mem_report")]
+fn pread_diag_v2(
+    event: &str,
+    task_slot: usize,
+    request: &SceKernelAioRWRequest,
+    group_slot: u32,
+    group_generation: u32,
+    request_index: u32,
+    value: i64,
+    anomaly: bool,
+) {
+    use core::fmt::Write as _;
+    let seq = PREAD_DIAG_SEQ_V2.fetch_add(1, Ordering::Relaxed);
+    // Keep logging sparse: first 128 events, then 1 in 128; always report anomalies.
+    if !anomaly && seq >= 128 && seq % 128 != 0 {
+        return;
+    }
+    let mut line = PreadDiagLineV2 { bytes: [0; 256], used: 0 };
+    if write!(
+        &mut line,
+        "{} ns={} event={} slot={} fd={} offset={} len={} buf={:#x} result={:#x} group={}:{} part={} value={}\n",
+        seq, stats::now(), event, task_slot, request.fd, request.offset,
+        request.nbyte, request.buf as usize, request.result as usize,
+        group_slot, group_generation, request_index, value,
+    ).is_err() {
+        return;
+    }
+    // The lock is only for the sampled log line, never for a physical pread.
+    while PREAD_DIAG_LOCK_V2.compare_exchange(
+        false, true, Ordering::Acquire, Ordering::Relaxed
+    ).is_err() {
+        core::hint::spin_loop();
+    }
+    // Use kernel syscalls so the diagnostics do not re-enter hooked libc routines.
+    let fd = unsafe {
+        sceKernelOpen(c"/data/ampr_pread_diag.log".as_ptr(), 1 | 8 | 0x200, 0o600)
+    };
+    if fd >= 0 {
+        let _ = unsafe { sceKernelWrite(fd, line.bytes.as_ptr().cast(), line.used) };
+        let _ = unsafe { sceKernelClose(fd) };
+    }
+    PREAD_DIAG_LOCK_V2.store(false, Ordering::Release);
+}
+
 impl AprAioReactor {
     unsafe extern "C" fn pread_worker_entry(arg: *mut c_void) -> *mut c_void {
         // Reactor priority, above the decode workers: a finished read is handed
@@ -66,6 +136,12 @@ impl AprAioReactor {
                     cv.wait(&mut guard);
                 }
             };
+            #[cfg(feature = "mem_report")]
+            {
+                let task = unsafe { &*addr_of!((*this).preadTasks[slot]) };
+                pread_diag_v2("start", slot, &request, task.targetSlot,
+                    task.targetGeneration, task.requestIndex, 0, false);
+            }
             let readStartNs = stats::now();
             let queueNs = readStartNs.saturating_sub(queuedNs);
             stats::add(Stat::PreadQueueNs, queueNs);
@@ -89,6 +165,13 @@ impl AprAioReactor {
             stats::max(Stat::PreadReadNsMax, readNs);
             // The task is RUNNING, so only this thread touches it until DONE.
             let task = unsafe { addr_of_mut!((*this).preadTasks[slot]) };
+            #[cfg(feature = "mem_report")]
+            unsafe {
+                // Worker owns RUNNING slot until it publishes DONE.
+                pread_diag_v2("done", slot, &request, (*task).targetSlot,
+                    (*task).targetGeneration, (*task).requestIndex, result,
+                    result < 0 || (result >= 0 && result as usize != request.nbyte));
+            }
             unsafe {
                 (*task).returnValue = result;
                 (*task).state.store(PREAD_DONE, Ordering::Release)
@@ -170,6 +253,30 @@ impl AprAioReactor {
             return SCE_KERNEL_ERROR_EAGAIN;
         }
         for (requestIndex, request) in requests.iter().enumerate() {
+            #[cfg(feature = "mem_report")]
+            {
+                let begin = request.buf as usize;
+                if let Some(end) = begin.checked_add(request.nbyte) {
+                    for (other_slot, other) in self.preadTasks.iter().enumerate() {
+                        if other.state.load(Ordering::Acquire) == PREAD_FREE {
+                            continue;
+                        }
+                        let other_begin = other.request.buf as usize;
+                        if let Some(other_end) = other_begin.checked_add(other.request.nbyte) {
+                            if begin < other_end && other_begin < end {
+                                pread_diag_v2("BUFFER_OVERLAP", slots[requestIndex], request,
+                                    targetSlot, targetGeneration, requestIndex as u32,
+                                    other_slot as i64, true);
+                            }
+                        }
+                    }
+                } else {
+                    pread_diag_v2("BUFFER_OVERFLOW", slots[requestIndex], request,
+                        targetSlot, targetGeneration, requestIndex as u32, -1, true);
+                }
+                pread_diag_v2("queue", slots[requestIndex], request,
+                    targetSlot, targetGeneration, requestIndex as u32, 0, false);
+            }
             let task = &mut self.preadTasks[slots[requestIndex]];
             task.request = *request;
             task.targetSlot = targetSlot;
@@ -200,6 +307,9 @@ impl AprAioReactor {
                 continue;
             }
             let task = &self.preadTasks[slot];
+            #[cfg(feature = "mem_report")]
+            pread_diag_v2("drain", slot, &task.request, task.targetSlot,
+                task.targetGeneration, task.requestIndex, task.returnValue, false);
             // Publish AIO results only on the reactor thread, after acquiring
             // PREAD_DONE. External callbacks can then observe a completed
             // group only after every request result is published.
@@ -258,6 +368,9 @@ impl AprAioReactor {
                 }
                 self.externalAioLiveCount.fetch_sub(1, Ordering::Release);
                 let completionState = e.completionState;
+                #[cfg(feature = "mem_report")]
+                pread_diag_v2("group_notify", slot, &self.preadTasks[slot].request,
+                    reference.slot, reference.generation, requestIndex, 0, false);
                 self.notify_external_aio(e, AprExternalAioEvent::Completed, completionState, false);
                 Self::release_external_aio_slot(e);
             }
