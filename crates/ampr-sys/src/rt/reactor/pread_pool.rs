@@ -9,6 +9,11 @@
 use super::*;
 use crate::rt::stats::{self, Stat};
 
+// Issue #13 experiment: reserve the game's thread budget.
+// Keep pread enabled, but do not allocate all configured readers up front.
+// This cap is deliberately conservative; it is NOT a proven final fix.
+const AMPR_TEST_PREAD_THREAD_BUDGET: usize = 2;
+
 impl AprAioReactor {
     unsafe extern "C" fn pread_worker_entry(arg: *mut c_void) -> *mut c_void {
         // Reactor priority, above the decode workers: a finished read is handed
@@ -105,11 +110,14 @@ impl AprAioReactor {
         }
     }
 
-    pub(super) fn ensure_pread_workers(&mut self) -> bool {
-        if self.preadThreadCount != 0 {
-            return true;
-        }
-        let count = crate::rt::tune::pread_threads().min(AMPR_EMU_PACK_PREAD_WORKERS);
+    // Start only as many readers as current queued work needs. The configured
+    // pread_threads remains an upper bound, not an eager thread count.
+    // The test budget leaves space for threads created by the game itself.
+    pub(super) fn ensure_pread_workers(&mut self, demand: usize) -> bool {
+        let count = crate::rt::tune::pread_threads()
+            .min(AMPR_EMU_PACK_PREAD_WORKERS)
+            .min(AMPR_TEST_PREAD_THREAD_BUDGET)
+            .min(demand.max(1));
         while self.preadThreadCount < count {
             let mut thread: ScePthread = null_mut();
             let rc = unsafe {
@@ -157,7 +165,10 @@ impl AprAioReactor {
         if requests.is_empty() || requests.len() > kAprExternalAioGroupMaxRequests {
             return SCE_KERNEL_ERROR_EINVAL;
         }
-        if !self.ensure_pread_workers() {
+        // This function runs on the reactor thread. Include existing pending
+        // work so a second reader is spawned only when it can be useful.
+        let demand = (self.preadPendingCount as usize).saturating_add(requests.len());
+        if !self.ensure_pread_workers(demand) {
             return SCE_KERNEL_ERROR_ENOMEM;
         }
         let _guard = unsafe { (&*addr_of!(self.preadMutex)).lock() };
@@ -190,7 +201,11 @@ impl AprAioReactor {
         }
         self.preadPendingCount += requests.len() as u32;
         stats::max(Stat::PreadPendingMax, self.preadPendingCount as u64);
-        self.preadCv.notify_all();
+        // Wake no more sleepers than new tasks. Keep notify_all() in the
+        // shutdown path: every worker must wake to observe preadStop.
+        for _ in 0..requests.len().min(self.preadThreadCount) {
+            self.preadCv.notify_one();
+        }
         0
     }
 
