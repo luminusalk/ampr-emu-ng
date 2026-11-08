@@ -87,12 +87,6 @@ impl AprAioReactor {
             stats::add(Stat::PreadBytes, bytesRead);
             stats::add(Stat::PreadReadNs, readNs);
             stats::max(Stat::PreadReadNsMax, readNs);
-            if !request.result.is_null() {
-                unsafe {
-                    (*request.result).returnValue = result;
-                    (*request.result).state = SCE_KERNEL_AIO_STATE_COMPLETED as u32;
-                }
-            }
             // The task is RUNNING, so only this thread touches it until DONE.
             let task = unsafe { addr_of_mut!((*this).preadTasks[slot]) };
             unsafe {
@@ -206,6 +200,15 @@ impl AprAioReactor {
                 continue;
             }
             let task = &self.preadTasks[slot];
+            // Publish AIO results only on the reactor thread, after acquiring
+            // PREAD_DONE. External callbacks can then observe a completed
+            // group only after every request result is published.
+            if !task.request.result.is_null() {
+                unsafe {
+                    (*task.request.result).returnValue = task.returnValue;
+                    (*task.request.result).state = SCE_KERNEL_AIO_STATE_COMPLETED as u32;
+                }
+            }
             if task.looseRead {
                 let target = ActiveReadRef {
                     slot: task.targetSlot,
