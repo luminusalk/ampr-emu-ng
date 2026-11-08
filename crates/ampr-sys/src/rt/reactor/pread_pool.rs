@@ -12,7 +12,7 @@ use crate::rt::stats::{self, Stat};
 // Issue #13 experiment: reserve the game's thread budget.
 // Keep pread enabled, but do not allocate all configured readers up front.
 // This cap is deliberately conservative; it is NOT a proven final fix.
-const AMPR_TEST_PREAD_THREAD_BUDGET: usize = 2;
+// Runtime admission ceiling is defined in tune.rs (debug knob; release stays conservative).
 
 impl AprAioReactor {
     unsafe extern "C" fn pread_worker_entry(arg: *mut c_void) -> *mut c_void {
@@ -116,7 +116,7 @@ impl AprAioReactor {
     pub(super) fn ensure_pread_workers(&mut self, demand: usize) -> bool {
         let count = crate::rt::tune::pread_threads()
             .min(AMPR_EMU_PACK_PREAD_WORKERS)
-            .min(AMPR_TEST_PREAD_THREAD_BUDGET)
+            .min(crate::rt::tune::pread_live_ceiling())
             .min(demand.max(1));
         while self.preadThreadCount < count {
             let mut thread: ScePthread = null_mut();

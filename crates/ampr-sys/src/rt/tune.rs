@@ -76,6 +76,7 @@ const READ_CHUNK_QUANTUM: usize = 12;
 const PER_READ_ACTIVE_KIB: usize = 13;
 const PER_READ_ACTIVE_CHUNKS: usize = 14;
 const LANE_EOP_OVERLAP: usize = 15;
+const PREAD_LIVE_CEILING: usize = 16;
 
 /// Smallest pass budget and per-read active window, in KiB: one full read
 /// slice (kSoftwareReadChunkMax, 512 KiB). A smaller value would leave a full
@@ -87,7 +88,7 @@ const READ_LIMIT_MAX_KIB: u32 = 16 * 1024;
 
 /// Cache sizes: 0 turns a cache off (reads bypass it); otherwise the cache
 /// allocators' minimums apply (decoded 16, physical 8 MiB, pack/manifest.rs).
-pub(crate) static KNOBS: [Knob; 16] = [
+pub(crate) static KNOBS: [Knob; 17] = [
     knob(
         "decoded_mib",
         false,
@@ -185,6 +186,8 @@ pub(crate) static KNOBS: [Knob; 16] = [
         1,
         AMPR_EMU_APR_LANE_EOP_OVERLAP as u32,
     ),
+    // Debug only: affects new reader creation, not existing readers.
+    knob("pread_live_ceiling", true, 1, 32, 2),
 ];
 
 /// (name, [decoded_mib, physical_mib, workers, pipelines, reserve_mib]).
@@ -285,6 +288,18 @@ pub(crate) fn pread_threads() -> usize {
         AMPR_EMU_PACK_PREAD_WORKERS
     }
 }
+/// Maximum number of physically created pread readers in this process.
+/// The existing `pread_threads` knob is a separate configured upper bound.
+/// Increasing this while the game runs can exhaust thread resources;
+/// lowering does not shut down readers that have already been created.
+pub(crate) fn pread_live_ceiling() -> usize {
+    if ON {
+        get(PREAD_LIVE_CEILING) as usize
+    } else {
+        2 // Keep the known-working conservative behavior in release builds.
+    }
+}
+
 // ---- reactor issue limits (reactor/progress.rs, reactor/read_window.rs) ----
 // Sized for kernel AIO, which serves 1-2 requests at a time on BFS
 // (reactor/mod.rs); the debug build makes them live to A/B them against the
